@@ -1120,6 +1120,39 @@ fn connected_clients(lan: &Value, wifi: &Value) -> (Value, i64, i64) {
         lan_count,
     )
 }
+/// `zte_router` on MU5250 leaks about 42 KB on every `router_lan_access_list`
+/// call, so the wired list is re-read only when the firmware's own wired count
+/// (`router_get_user_list_num`, which does not leak) changes.
+static LAN_CLIENTS: OnceLock<Mutex<Option<(i64, Value)>>> = OnceLock::new();
+
+fn cached_lan_clients(cache: &Option<(i64, Value)>, lan_num: Option<i64>) -> Option<Value> {
+    match (cache, lan_num) {
+        (Some((cached, list)), Some(count)) if *cached == count => Some(list.clone()),
+        _ => None,
+    }
+}
+
+async fn lan_clients() -> Result<Value, String> {
+    let lan_num = ubus("zwrt_router.api", "router_get_user_list_num", json!({}))
+        .await
+        .ok()
+        .and_then(|v| v.get("lan_num").and_then(Value::as_i64));
+    let cache = LAN_CLIENTS.get_or_init(|| Mutex::new(None));
+    let hit = cached_lan_clients(&cache.lock().unwrap(), lan_num);
+    if let Some(list) = hit {
+        return Ok(list);
+    }
+    let list = ubus(
+        "zwrt_router.api",
+        "router_lan_access_list",
+        json!({"start_id":1,"end_id":64}),
+    )
+    .await?;
+    if let Some(count) = lan_num {
+        *cache.lock().unwrap() = Some((count, list.clone()));
+    }
+    Ok(list)
+}
 fn memory_fields(info: &Value) -> (i64, i64, i64) {
     let m = info.get("memory").unwrap_or(&Value::Null);
     let t = integer(m, "total");
@@ -1417,12 +1450,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     )
     .await;
     let imei = ubus("zwrt_zte_mdm.api", "get_imei", json!({})).await;
-    let lan_clients = ubus(
-        "zwrt_router.api",
-        "router_lan_access_list",
-        json!({"start_id":1,"end_id":64}),
-    )
-    .await;
+    let lan_clients = lan_clients().await;
     let wifi_clients = ubus(
         "zwrt_router.api",
         "router_wireless_access_list",
@@ -2395,6 +2423,15 @@ mod tests {
         let v = interface(&json!({}));
         assert_eq!(v["up"], false);
         assert_eq!(v["ipv4"], json!([]))
+    }
+    #[test]
+    fn lan_clients_are_reused_only_while_the_wired_count_is_unchanged() {
+        let list = json!({"lan_access_list_info":[{"mac_address":"AA:BB:CC:DD:EE:01"}]});
+        let cache = Some((1, list.clone()));
+        assert_eq!(cached_lan_clients(&cache, Some(1)), Some(list));
+        assert_eq!(cached_lan_clients(&cache, Some(2)), None);
+        assert_eq!(cached_lan_clients(&cache, None), None);
+        assert_eq!(cached_lan_clients(&None, Some(1)), None);
     }
     #[test]
     fn connected_clients_ignore_historical_leases() {
