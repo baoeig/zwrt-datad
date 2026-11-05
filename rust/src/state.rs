@@ -1121,35 +1121,52 @@ fn connected_clients(lan: &Value, wifi: &Value) -> (Value, i64, i64) {
     )
 }
 /// `zte_router` on MU5250 leaks about 42 KB on every `router_lan_access_list`
-/// call, so the wired list is re-read only when the firmware's own wired count
-/// (`router_get_user_list_num`, which does not leak) changes.
-static LAN_CLIENTS: OnceLock<Mutex<Option<(i64, Value)>>> = OnceLock::new();
+/// and `router_wireless_access_list` call, so each list is re-read only when
+/// the firmware's own client counts (`router_get_user_list_num`, which does
+/// not leak) change.
+type ClientCache = OnceLock<Mutex<Option<(Value, Value)>>>;
+static LAN_CLIENTS: ClientCache = OnceLock::new();
+static WIFI_CLIENTS: ClientCache = OnceLock::new();
+const LAN_COUNT_FIELDS: &[&str] = &["lan_num"];
+const WIFI_COUNT_FIELDS: &[&str] = &[
+    "wireless_num",
+    "guest_num_24g",
+    "guest_num_5g",
+    "guest_num_6g",
+];
 
-fn cached_lan_clients(cache: &Option<(i64, Value)>, lan_num: Option<i64>) -> Option<Value> {
-    match (cache, lan_num) {
-        (Some((cached, list)), Some(count)) if *cached == count => Some(list.clone()),
+/// The first field must be present; the guest counts are absent on some
+/// firmware and count as zero there.
+fn client_count_key(counts: &Value, fields: &[&str]) -> Option<Value> {
+    let (first, rest) = fields.split_first()?;
+    let mut key = vec![counts.get(*first)?.as_i64()?];
+    key.extend(
+        rest.iter()
+            .map(|field| counts.get(*field).and_then(Value::as_i64).unwrap_or(0)),
+    );
+    Some(json!(key))
+}
+
+fn cached_clients(cache: &Option<(Value, Value)>, key: &Option<Value>) -> Option<Value> {
+    match (cache, key) {
+        (Some((cached, list)), Some(key)) if cached == key => Some(list.clone()),
         _ => None,
     }
 }
 
-async fn lan_clients() -> Result<Value, String> {
-    let lan_num = ubus("zwrt_router.api", "router_get_user_list_num", json!({}))
-        .await
-        .ok()
-        .and_then(|v| v.get("lan_num").and_then(Value::as_i64));
-    let cache = LAN_CLIENTS.get_or_init(|| Mutex::new(None));
-    let hit = cached_lan_clients(&cache.lock().unwrap(), lan_num);
+async fn client_list(
+    cache: &'static ClientCache,
+    key: Option<Value>,
+    method: &str,
+) -> Result<Value, String> {
+    let cache = cache.get_or_init(|| Mutex::new(None));
+    let hit = cached_clients(&cache.lock().unwrap(), &key);
     if let Some(list) = hit {
         return Ok(list);
     }
-    let list = ubus(
-        "zwrt_router.api",
-        "router_lan_access_list",
-        json!({"start_id":1,"end_id":64}),
-    )
-    .await?;
-    if let Some(count) = lan_num {
-        *cache.lock().unwrap() = Some((count, list.clone()));
+    let list = ubus("zwrt_router.api", method, json!({"start_id":1,"end_id":64})).await?;
+    if let Some(key) = key {
+        *cache.lock().unwrap() = Some((key, list.clone()));
     }
     Ok(list)
 }
@@ -1450,11 +1467,24 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     )
     .await;
     let imei = ubus("zwrt_zte_mdm.api", "get_imei", json!({})).await;
-    let lan_clients = lan_clients().await;
-    let wifi_clients = ubus(
-        "zwrt_router.api",
+    let client_counts = ubus("zwrt_router.api", "router_get_user_list_num", json!({}))
+        .await
+        .ok();
+    let count_key = |fields: &[&str]| {
+        client_counts
+            .as_ref()
+            .and_then(|counts| client_count_key(counts, fields))
+    };
+    let lan_clients = client_list(
+        &LAN_CLIENTS,
+        count_key(LAN_COUNT_FIELDS),
+        "router_lan_access_list",
+    )
+    .await;
+    let wifi_clients = client_list(
+        &WIFI_CLIENTS,
+        count_key(WIFI_COUNT_FIELDS),
         "router_wireless_access_list",
-        json!({"start_id":1,"end_id":64}),
     )
     .await;
     let router_status = ubus("zwrt_router.api", "router_get_status_no_auth", json!({})).await;
@@ -2425,13 +2455,24 @@ mod tests {
         assert_eq!(v["ipv4"], json!([]))
     }
     #[test]
-    fn lan_clients_are_reused_only_while_the_wired_count_is_unchanged() {
+    fn client_lists_are_reused_only_while_the_counts_are_unchanged() {
         let list = json!({"lan_access_list_info":[{"mac_address":"AA:BB:CC:DD:EE:01"}]});
-        let cache = Some((1, list.clone()));
-        assert_eq!(cached_lan_clients(&cache, Some(1)), Some(list));
-        assert_eq!(cached_lan_clients(&cache, Some(2)), None);
-        assert_eq!(cached_lan_clients(&cache, None), None);
-        assert_eq!(cached_lan_clients(&None, Some(1)), None);
+        let cache = Some((json!([1]), list.clone()));
+        assert_eq!(cached_clients(&cache, &Some(json!([1]))), Some(list));
+        assert_eq!(cached_clients(&cache, &Some(json!([2]))), None);
+        assert_eq!(cached_clients(&cache, &None), None);
+        assert_eq!(cached_clients(&None, &Some(json!([1]))), None);
+    }
+    #[test]
+    fn client_count_key_needs_the_main_count_and_defaults_guests_to_zero() {
+        let counts = json!({"access_total_num":4,"lan_num":1,"wireless_num":3,"guest_num_5g":1});
+        assert_eq!(client_count_key(&counts, LAN_COUNT_FIELDS), Some(json!([1])));
+        assert_eq!(
+            client_count_key(&counts, WIFI_COUNT_FIELDS),
+            Some(json!([3, 0, 1, 0]))
+        );
+        assert_eq!(client_count_key(&json!({"lan_num":1}), WIFI_COUNT_FIELDS), None);
+        assert_eq!(client_count_key(&json!({}), LAN_COUNT_FIELDS), None);
     }
     #[test]
     fn connected_clients_ignore_historical_leases() {
